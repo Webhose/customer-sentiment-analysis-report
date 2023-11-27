@@ -1,0 +1,407 @@
+import json
+import glob
+import docx
+import requests
+from openai import OpenAI
+import os
+import openai
+from docx.shared import Pt
+from bs4 import BeautifulSoup
+import io
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.shared import OxmlElement, qn
+from docx.opc.constants import RELATIONSHIP_TYPE
+
+
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+NUM_OF_REVIEWS = 50
+
+client = OpenAI()
+
+
+def add_image_from_base64(doc, image_url):
+    response = requests.get(image_url)
+
+    # Check if the request was successful
+    if response.status_code == 200:
+        image_stream = io.BytesIO(response.content)
+        doc.add_picture(image_stream, width=docx.shared.Inches(6))
+    else:
+        print(f"Failed to download image. Status code: {response.status_code}")
+
+
+
+def html_to_word(doc, html_content):
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    for element in soup.find_all(['strong', 'ul']):
+        if element.name == 'strong':
+            # Add bold text as a heading
+            doc.add_paragraph(element.get_text().strip(), style='Heading 2')
+        elif element.name == 'ul':
+            for item in element.find_all('li'):
+                # Add list items
+                doc.add_paragraph(item.get_text().strip(), style='List Bullet')
+
+def add_hyperlink(paragraph, url, text):
+    """
+    A function that places a hyperlink within a paragraph object.
+
+    :param paragraph: The paragraph we are adding the hyperlink to.
+    :param url: The URL the link points to.
+    :param text: The text displayed for the link.
+    """
+    part = paragraph.part
+    r_id = part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+
+    # Set the style for the hyperlink (color, underline)
+    c = OxmlElement('w:color')
+    c.set(qn('w:val'), '0000FF')  # Blue color
+    rPr.append(c)
+    u = OxmlElement('w:u')
+    u.set(qn('w:val'), 'single')
+    rPr.append(u)
+
+    new_run.append(rPr)
+    new_run.text = text
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+
+def insert_titles_in_text(text, reports):
+    # Placeholder for inserting the titles
+    placeholder = "[]"
+
+    # Extracting the titles from the reports and formatting them with new lines
+    titles = "\n".join([report['title'] for report in reports])
+
+    # Replacing the placeholder with the titles
+    updated_text = text.replace(placeholder, titles)
+
+    return updated_text
+
+
+def generate_article_image(name):
+    print("Generating post image")
+    image_url = ""
+    try:
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=f"Create a professional and informative cover for a Customer Sentiment Analysis report. The image should feature a diverse range of emoticons, including happy, sad, and neutral faces, symbolizing different customer emotions. Include a large, digital-style bar graph in the center, illustrating varying levels of customer satisfaction, with each bar colored according to the sentiment it represents (green for positive, red for negative, yellow for neutral). The overall color scheme should be clean and professional, with a balance of bright and muted colors to convey a sense of data-driven analysis and insight. The image must not show any text. ",
+            n=1,
+            size="1024x1024"
+        )
+        image_url = response.data[0].url
+
+
+
+    except Exception as e:
+        print("An error occurred generating the image:", str(e))
+
+    return image_url
+
+def call_gpt_completion(prompt):
+    return client.chat.completions.create(
+        model="gpt-4-1106-preview",
+        max_tokens=4096,
+        messages=[
+            {"role": "user", "content": prompt},
+        ]
+    )
+
+
+def extract_points(reviews, sentiment):
+
+    print("Extract Points: " + sentiment)
+
+    points = []
+
+    for review in reviews:
+
+        review_text = review['title'] + "\n" + review['text']
+        prompt = f"The following is a {sentiment} review of a product, summarize in one bullet point the main {sentiment} feedback:\n{review_text}"
+        summary = ""
+        try:
+            response = call_gpt_completion(prompt)
+
+            for choice in response.choices:
+                summary += choice.message.content
+        except Exception as e:
+            print("An error occurred:", str(e))
+
+        points.append(summary)
+        if len(points) == NUM_OF_REVIEWS:
+            break
+
+    return points
+
+def generate_intro(product_name, product_description):
+    print("Generate post intro")
+
+    prompt = f"""
+        Write a paragraph introducing a customer sentiment report about:
+        Product name: {product_name}
+        Product description: {product_description}
+
+        The report is created automatically by using Webz.io eCommerce api and ChatGPT. The report is generated by calling the Webz.io eCommerce API for the reviews about {product_name}. It then splits the product reviews into positive and negative reviews. Following this step, it summarizes up to {NUM_OF_REVIEWS} reviews from both negative and positive reviews using ChatGPT to create a comprehensive list of posts. It then gives those lists to ChatGPT to create a comprehansive report highlighting both positive and negative feedback and provide a report based on the feedback.  
+        """
+
+    intro = ""
+    try:
+        response = call_gpt_completion(prompt)
+
+        for choice in response.choices:
+            intro += choice.message.content
+    except Exception as e:
+        print("An error occurred:", str(e))
+
+    return intro
+
+def generate_title(product_name):
+    print("Creating a title")
+
+    prompt = "Create a title for a customer sentiment report about the following product:\n" + product_name
+    title_text = ""
+    try:
+        response = call_gpt_completion(prompt)
+
+        for choice in response.choices:
+            title_text += choice.message.content
+    except Exception as e:
+        print("An error occurred:", str(e))
+
+    title_text = title_text.strip(" ").strip('\"')
+    if title_text.startswith("Title:"):  # Sometimes ChatGPT prefix the title with Title:
+        return title_text[len("Title:"):]
+
+    return title_text
+
+
+def create_negative_report(feedback, product_name):
+    print("Generating Negative Report")
+
+    prompt = f"""Create a customer sentiment analysis report that includes the following sections. Use  <UL> and <LI> tags for listing items and <strong> for the titles of each section.
+
+                 
+            <HTML>
+            <strong>Analysis of Feedback</strong>
+            <UL><LI>Summarize recurring and common negative issues mentioned in the reviews.</LI></UL>
+            
+            <strong>Recommendations</strong>
+            <UL><LI>Based on the analysis, suggest actionable measures the company can take to address the issues raised in the feedback.</LI></UL>
+
+            <strong>Conclusion</strong>
+            <UL><LI>Summarize the key findings of the report.</LI></UL>
+
+            
+            </HTML>
+                
+                The following is the list of the negative feedback about the product you will base your report on:
+                
+                {feedback}
+
+                    """
+
+    try:
+        response = call_gpt_completion(prompt)
+
+        report = ""
+
+        for choice in response.choices:
+            report += choice.message.content
+
+
+
+
+
+
+    except Exception as e:
+        print("An error occurred:", str(e))
+
+    return report
+
+
+def create_positive_report(feedback, product_name):
+    print("Generating Positive Report")
+
+    prompt = f"""Create a customer sentiment analysis report that includes the following sections. Use  <UL> and <LI> tags for listing items and <strong> for the titles of each section. 
+
+                <HTML>
+                <strong>Detailed Analysis</strong>
+                <UL><LI>Summarize common positive feedback mentioned in the reviews.</LI></UL>
+
+                <strong>Recommendations </strong>
+                <UL><LI>Propose marketing strategies that leverage the positive aspects highlighted in the reviews. </LI></UL>
+
+                <strong>Conclusion </strong>
+                <UL><LI>Summarize the key findings and the overall sentiment of the customers towards the product.</LI></UL>
+
+                </HTML>
+                        
+                
+                The following is the list of the positive feedback about the product you will base your report on:
+                
+                {feedback}
+
+                """
+
+    try:
+        response = call_gpt_completion(prompt)
+
+        report = ""
+
+        for choice in response.choices:
+            report += choice.message.content
+
+
+
+
+    except Exception as e:
+        print("An error occurred:", str(e))
+
+
+    return report
+
+def create_word_doc(file_name, title_text, image_url, product_details, intro, negative_report, positive_report, one_star_count, two_star_count, three_star_count, four_star_count, five_star_count):
+    print("Saving to word document")
+
+    total_count = one_star_count + two_star_count + three_star_count + four_star_count + five_star_count
+
+    doc = docx.Document()
+
+    # Add a title
+    title = doc.add_paragraph()
+    title.style = 'Title'
+    title_run = title.add_run(title_text)
+    title_run.font.size = Pt(24)  # Set the font size
+    title_run.font.name = 'Arial (Body)'  # Set the font
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER  # Center align the title
+
+    if len(image_url) > 0:
+        add_image_from_base64(doc, image_url)
+
+    title = doc.add_paragraph(style='Heading 1')
+    title_run = title.add_run("Product Details")
+    title_run.font.name = 'Arial (Body)'  # Set the font
+
+    p = doc.add_paragraph()
+    add_hyperlink(p, product_details['url'], product_details['name'])
+    p.add_run("\n* Price: {}\n* Total Reviews: {}\n* Aggregated Rating: {}\n* 1 Start Count: {}\n* 2 Start Count: {}\n* 3 Start Count: {}\n* 4 Start Count:{}\n* 5 Start Count: {}\n".format(
+        product_details['price'], product_details['review_count'], product_details['aggregated_rating'], one_star_count, two_star_count, three_star_count, four_star_count, five_star_count))
+
+
+
+    title = doc.add_paragraph(style='Heading 1')
+    title_run = title.add_run("Introduction")
+    title_run.font.name = 'Arial (Body)'  # Set the font
+
+    doc.add_paragraph(intro)
+
+    # Positive feedback
+    title = doc.add_paragraph(style='Heading 1')
+    title_run = title.add_run("Positive Feedback Analysis")
+    positive_percentage = round(100 * ((four_star_count + five_star_count) / total_count))
+    doc.add_paragraph(f"Around {positive_percentage}% gave the product a very positive feedback (four and five star rating). The following analysis summarizes the recurring themes and findings in the reviews for the product.  ")
+
+
+    title_run.font.name = 'Arial (Body)'  # Set the font
+    html_to_word(doc, positive_report)
+
+
+    # Negative feedback
+    title = doc.add_paragraph(style='Heading 1')
+    title_run = title.add_run("Negative Feedback Analysis")
+    negative_percentage = round(100 * ((one_star_count + two_star_count) / total_count))
+    doc.add_paragraph(f"Around {negative_percentage}% gave the product a very negative feedback (one and two star rating). The following analysis summarizes the recurring themes and findings in the reviews for the product.  ")
+    title_run.font.name = 'Arial (Body)'  # Set the font
+    html_to_word(doc, negative_report)
+
+
+
+
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            run.font.name = 'Arial (Body)'
+
+    # Save the document
+    doc.save(file_name)
+
+
+
+def read_ndjson_file(file_path):
+    """Reads an ndjson file and returns the content as a list of dictionaries."""
+    with open(file_path, 'r', encoding='utf-8') as file:
+        return [json.loads(line) for line in file]
+
+def main():
+    # Path to the reviews folder
+    reviews_folder = 'reviews'
+
+    # Read product information
+    product_info = read_ndjson_file(os.path.join(reviews_folder, 'Products.ndjson'))[0]
+
+    # Initialize an empty list to store all reviews
+    positive_reviews = []
+    negative_reviews = []
+
+    # Counters for each star rating
+    one_star_count = 0
+    two_star_count = 0
+    three_star_count = 0
+    four_star_count = 0
+    five_star_count = 0
+
+    # Read all reviews files in the reviews folder and add those with substantial text into separate lists
+    for review_file in glob.glob(os.path.join(reviews_folder, 'Reviews_*.ndjson')):
+        reviews = read_ndjson_file(review_file)
+        for review in reviews:
+
+            if review['rating'] == 1:
+                one_star_count += 1
+            elif review['rating'] == 2:
+                two_star_count += 1
+            elif review['rating'] == 3:
+                three_star_count += 1
+            elif review['rating'] == 4:
+                four_star_count += 1
+            elif review['rating'] == 5:
+                five_star_count += 1
+
+            if len(review['text']) > 100:
+                if review['rating'] <3: #  1-2 stars rating is negative
+                    negative_reviews.append(review)
+                if review['rating'] >3: # 4-5 starts reating is positive
+                    positive_reviews.append(review)
+
+    image_url = generate_article_image(product_info['name'])
+    title = generate_title(product_info['name'])
+    intro = generate_intro(product_info['name'], product_info['description'])
+
+    positive_bullet_points = "\n".join(extract_points(positive_reviews, 'positive'))
+    negative_bullet_points = "\n".join(extract_points(negative_reviews, 'negative'))
+
+    positive_report = create_positive_report(positive_bullet_points, product_info['name'])
+    negative_report = create_negative_report(negative_bullet_points, product_info['name'])
+
+
+    create_word_doc("customer sentiment analysis report.docx", title, image_url, product_info , intro, negative_report, positive_report,
+                    one_star_count, two_star_count, three_star_count, four_star_count, five_star_count)
+
+
+
+
+
+    print("done")
+
+
+
+
+if __name__ == "__main__":
+    main()
